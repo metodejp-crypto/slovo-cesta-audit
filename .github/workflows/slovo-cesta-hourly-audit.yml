@@ -1,1 +1,171 @@
 
+name: Slovo Cesta hourly cheap guard
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      AUDIT_BASE_URL: ${{ secrets.AUDIT_BASE_URL }}
+      AUDIT_ROUTES: ${{ vars.AUDIT_ROUTES }}
+      REPORT_TO: ${{ secrets.REPORT_TO }}
+      REPORT_FROM: ${{ secrets.REPORT_FROM }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_SECURE: ${{ secrets.SMTP_SECURE }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+
+    steps:
+      - name: Run cheap availability and security guard
+        id: guard
+        shell: bash
+        run: |
+          set +e
+          mkdir -p audit-results
+          REPORT="audit-results/report.md"
+          : > "$REPORT"
+
+          echo "# Slovo · Cesta — levná hodinová kontrola" >> "$REPORT"
+          echo "" >> "$REPORT"
+          echo "Čas UTC: $(date -u '+%Y-%m-%d %H:%M:%S')" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          ISSUES=0
+
+          add_issue() {
+            ISSUES=$((ISSUES+1))
+            echo "- $1" >> "$REPORT"
+          }
+
+          echo "## Nálezy" >> "$REPORT"
+
+          if [ -z "$AUDIT_BASE_URL" ]; then
+            add_issue "Chybí GitHub secret AUDIT_BASE_URL. Hlídač zatím neví, jakou adresu má kontrolovat."
+          else
+            BASE="${AUDIT_BASE_URL%/}"
+            ROUTES="${AUDIT_ROUTES:-/}"
+
+            if [[ "$BASE" != https://* ]]; then
+              add_issue "Aplikace neběží přes HTTPS: $BASE"
+            fi
+
+            echo "" >> "$REPORT"
+            echo "## Kontrolované stránky" >> "$REPORT"
+
+            for ROUTE in $(echo "$ROUTES" | tr ',' ' '); do
+              if [[ "$ROUTE" == http* ]]; then
+                URL="$ROUTE"
+              elif [[ "$ROUTE" == /* ]]; then
+                URL="$BASE$ROUTE"
+              else
+                URL="$BASE/$ROUTE"
+              fi
+
+              SAFE="$(echo "$ROUTE" | tr '/:?.&=' '_______')"
+              HEADER="audit-results/headers-${SAFE:-root}.txt"
+              BODY="audit-results/body-${SAFE:-root}.html"
+
+              CODE=$(curl -L -sS --max-time 25 -D "$HEADER" -o "$BODY" -w "%{http_code}" "$URL")
+              echo "- $URL → HTTP $CODE" >> "$REPORT"
+
+              if [ "$CODE" = "000" ] || [ "$CODE" -ge 400 ]; then
+                add_issue "Stránka neodpověděla správně: $URL má HTTP $CODE"
+              fi
+
+              if grep -Eiq "src=['\"]http://|href=['\"]http://" "$BODY"; then
+                add_issue "Na stránce je mixed content: $URL obsahuje http:// zdroj."
+              fi
+
+              if grep -Eio "(AIza[0-9A-Za-z_-]{20,}|ghp_[0-9A-Za-z]{20,}|AKIA[0-9A-Z]{16}|sk-[0-9A-Za-z]{20,})" "$BODY" >/dev/null; then
+                add_issue "Ve veřejném HTML je podezřelý klíč nebo token: $URL"
+              fi
+
+              if grep -iq "^access-control-allow-origin: \*" "$HEADER"; then
+                add_issue "CORS je příliš otevřený na stránce: $URL"
+              fi
+
+              for H in content-security-policy strict-transport-security x-content-type-options x-frame-options referrer-policy; do
+                if ! grep -iq "^$H:" "$HEADER"; then
+                  echo "  - info: chybí bezpečnostní hlavička $H" >> "$REPORT"
+                fi
+              done
+            done
+
+            echo "" >> "$REPORT"
+            echo "## Citlivé veřejné soubory" >> "$REPORT"
+
+            for P in "/.env" "/.git/config"; do
+              CODE=$(curl -L -sS --max-time 10 -o /tmp/slovo-check.txt -w "%{http_code}" "$BASE$P")
+              echo "- $BASE$P → HTTP $CODE" >> "$REPORT"
+              if [ "$CODE" != "000" ] && [ "$CODE" -lt 400 ]; then
+                add_issue "Citlivá cesta je veřejně dostupná: $BASE$P"
+              fi
+            done
+          fi
+
+          if [ "$ISSUES" -eq 0 ]; then
+            echo "" >> "$REPORT"
+            echo "✅ Bez vážného nálezu." >> "$REPORT"
+          else
+            echo "" >> "$REPORT"
+            echo "⚠️ Počet vážnějších nálezů: $ISSUES" >> "$REPORT"
+          fi
+
+          echo "issues=$ISSUES" >> "$GITHUB_OUTPUT"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-results
+          path: audit-results
+          retention-days: 3
+
+      - name: Send e-mail only when problem is found
+        if: steps.guard.outputs.issues != '0'
+        shell: bash
+        env:
+          ISSUES: ${{ steps.guard.outputs.issues }}
+        run: |
+          python3 - <<'PY'
+          import os, smtplib, ssl
+          from email.message import EmailMessage
+
+          needed = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "REPORT_TO"]
+          missing = [x for x in needed if not os.environ.get(x)]
+          if missing:
+              print("E-mail se neposílá, chybí secrets:", ", ".join(missing))
+              raise SystemExit(0)
+
+          with open("audit-results/report.md", "r", encoding="utf-8") as f:
+              body = f.read()
+
+          msg = EmailMessage()
+          msg["Subject"] = f"Slovo Cesta audit: {os.environ.get('ISSUES', '?')} nález(ů)"
+          msg["From"] = os.environ.get("REPORT_FROM") or os.environ["SMTP_USER"]
+          msg["To"] = os.environ["REPORT_TO"]
+          msg.set_content(body)
+
+          host = os.environ["SMTP_HOST"]
+          port = int(os.environ.get("SMTP_PORT") or "465")
+          secure = (os.environ.get("SMTP_SECURE") or "true").lower() == "true"
+
+          if secure:
+              with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context()) as s:
+                  s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+                  s.send_message(msg)
+          else:
+              with smtplib.SMTP(host, port) as s:
+                  s.starttls(context=ssl.create_default_context())
+                  s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+                  s.send_message(msg)
+          PY
