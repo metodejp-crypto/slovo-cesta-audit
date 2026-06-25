@@ -1,1 +1,586 @@
+name: Slovo Cesta daily crossover audit
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 5 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: slovo-cesta-daily-crossover-audit
+  cancel-in-progress: false
+
+jobs:
+  crossover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      AUDIT_BASE_URL: ${{ secrets.AUDIT_BASE_URL }}
+      AUDIT_ROUTES: ${{ vars.AUDIT_ROUTES }}
+      AUDIT_MAX_PAGES: ${{ vars.AUDIT_MAX_PAGES }}
+      REPORT_TO: ${{ secrets.REPORT_TO }}
+      REPORT_FROM: ${{ secrets.REPORT_FROM }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_SECURE: ${{ secrets.SMTP_SECURE }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Playwright
+        shell: bash
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@latest >/dev/null 2>&1
+          npx playwright install chromium --with-deps
+
+      - name: Create crossover audit script
+        shell: bash
+        run: |
+          cat > crossover-audit.mjs <<'JS'
+          import { chromium } from "playwright";
+          import fs from "fs";
+          import path from "path";
+
+          const outDir = "audit-results";
+          const screenshotDir = path.join(outDir, "screenshots");
+          fs.mkdirSync(outDir, { recursive: true });
+          fs.mkdirSync(screenshotDir, { recursive: true });
+
+          const baseRaw = (process.env.AUDIT_BASE_URL || "").trim();
+          const maxPages = Number(process.env.AUDIT_MAX_PAGES || 8);
+          const requestedRoutes = (process.env.AUDIT_ROUTES || "/")
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean);
+
+          const devices = [
+            {
+              name: "desktop",
+              label: "Desktop 1440×900",
+              viewport: { width: 1440, height: 900 },
+              isMobile: false,
+              hasTouch: false
+            },
+            {
+              name: "mobile-portrait",
+              label: "Mobil portrait 390×844",
+              viewport: { width: 390, height: 844 },
+              isMobile: true,
+              hasTouch: true
+            },
+            {
+              name: "mobile-landscape",
+              label: "Mobil landscape 844×390",
+              viewport: { width: 844, height: 390 },
+              isMobile: true,
+              hasTouch: true
+            },
+            {
+              name: "tablet-portrait",
+              label: "Tablet portrait 768×1024",
+              viewport: { width: 768, height: 1024 },
+              isMobile: true,
+              hasTouch: true
+            },
+            {
+              name: "tablet-landscape",
+              label: "Tablet landscape 1024×768",
+              viewport: { width: 1024, height: 768 },
+              isMobile: true,
+              hasTouch: true
+            }
+          ];
+
+          const findings = [];
+          const tested = [];
+
+          function safeName(value) {
+            return String(value || "root")
+              .replace(/[^a-z0-9._-]+/gi, "_")
+              .slice(0, 140);
+          }
+
+          function addFinding(priority, device, route, message) {
+            findings.push({
+              priority,
+              device,
+              route,
+              message: String(message || "").replace(/\s+/g, " ").slice(0, 500)
+            });
+          }
+
+          function routeToUrl(base, route) {
+            if (!route || route === "/") return base.href;
+            if (/^https?:\/\//i.test(route)) return route;
+            if (route.startsWith("/")) return new URL(route, base).href;
+            return new URL("/" + route, base).href;
+          }
+
+          function routeLabel(base, urlOrRoute) {
+            try {
+              const u = new URL(routeToUrl(base, urlOrRoute));
+              return u.pathname + u.search;
+            } catch {
+              return String(urlOrRoute || "/");
+            }
+          }
+
+          function isSafeInternalUrl(base, href) {
+            try {
+              const u = new URL(href);
+              if (u.origin !== base.origin) return false;
+              const text = (u.pathname + u.search + u.hash).toLowerCase();
+              if (text.match(/\.(pdf|zip|png|jpg|jpeg|webp|gif|svg|mp3|mp4|mov|avi|doc|docx|xls|xlsx)$/)) return false;
+              if (text.match(/logout|signout|delete|remove|billing|payment|checkout|oauth|auth\/callback/)) return false;
+              return true;
+            } catch {
+              return false;
+            }
+          }
+
+          async function discoverRoutes(browser, base) {
+            const routes = new Set(requestedRoutes.length ? requestedRoutes : ["/"]);
+
+            const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+
+            try {
+              await page.goto(base.href, { waitUntil: "domcontentloaded", timeout: 30000 });
+              await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+              const links = await page.evaluate(() =>
+                Array.from(document.querySelectorAll("a[href]"))
+                  .map((a) => a.href)
+                  .filter(Boolean)
+              );
+
+              for (const href of links) {
+                if (routes.size >= maxPages) break;
+                if (!isSafeInternalUrl(base, href)) continue;
+                const u = new URL(href);
+                routes.add(u.pathname + u.search);
+              }
+            } catch (error) {
+              addFinding("P1", "discovery", "/", "Nepodařilo se načíst úvodní stránku pro hledání dalších cest: " + error.message);
+            } finally {
+              await page.close().catch(() => {});
+            }
+
+            return Array.from(routes).slice(0, maxPages);
+          }
+
+          async function inspectPage(browser, base, route, device) {
+            const url = routeToUrl(base, route);
+            const context = await browser.newContext({
+              viewport: device.viewport,
+              isMobile: device.isMobile,
+              hasTouch: device.hasTouch,
+              deviceScaleFactor: device.isMobile ? 2 : 1,
+              ignoreHTTPSErrors: false
+            });
+
+            const page = await context.newPage();
+
+            const consoleErrors = [];
+            const pageErrors = [];
+            const failedRequests = [];
+            const badResponses = [];
+
+            page.on("console", (msg) => {
+              if (msg.type() === "error") {
+                consoleErrors.push(msg.text());
+              }
+            });
+
+            page.on("pageerror", (err) => {
+              pageErrors.push(err.message);
+            });
+
+            page.on("requestfailed", (request) => {
+              failedRequests.push(request.url() + " — " + (request.failure()?.errorText || "request failed"));
+            });
+
+            page.on("response", (response) => {
+              const status = response.status();
+              const type = response.request().resourceType();
+              if (status >= 500) {
+                badResponses.push(`HTTP ${status} ${type}: ${response.url()}`);
+              } else if (status >= 400 && ["document", "script", "xhr", "fetch"].includes(type)) {
+                badResponses.push(`HTTP ${status} ${type}: ${response.url()}`);
+              }
+            });
+
+            let pageHadIssue = false;
+
+            try {
+              const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+              await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(() => {});
+              await page.waitForTimeout(800);
+
+              const status = response ? response.status() : 0;
+              tested.push(`${device.label} — ${routeLabel(base, route)} — HTTP ${status || "bez odpovědi"}`);
+
+              if (!response) {
+                addFinding("P1", device.label, routeLabel(base, route), "Stránka nevrátila hlavní HTTP odpověď.");
+                pageHadIssue = true;
+              } else if (status >= 400) {
+                addFinding("P1", device.label, routeLabel(base, route), `Hlavní stránka vrátila HTTP ${status}.`);
+                pageHadIssue = true;
+              }
+
+              const checks = await page.evaluate(() => {
+                const viewportW = window.innerWidth;
+                const viewportH = window.innerHeight;
+                const root = document.documentElement;
+                const body = document.body;
+
+                const maxScrollWidth = Math.max(
+                  root ? root.scrollWidth : 0,
+                  body ? body.scrollWidth : 0
+                );
+
+                const overflowX = maxScrollWidth - viewportW;
+
+                function visible(el) {
+                  const style = window.getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  return (
+                    style &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden" &&
+                    Number(style.opacity) !== 0 &&
+                    rect.width > 2 &&
+                    rect.height > 2
+                  );
+                }
+
+                function label(el) {
+                  const txt =
+                    el.getAttribute("aria-label") ||
+                    el.getAttribute("title") ||
+                    el.getAttribute("data-testid") ||
+                    el.innerText ||
+                    el.textContent ||
+                    el.tagName;
+                  return String(txt).replace(/\s+/g, " ").trim().slice(0, 90);
+                }
+
+                const interactiveProblems = [];
+                const outsideProblems = [];
+
+                const interactive = Array.from(
+                  document.querySelectorAll(
+                    "a[href], button, input, textarea, select, [role='button'], [tabindex]:not([tabindex='-1'])"
+                  )
+                ).slice(0, 250);
+
+                for (const el of interactive) {
+                  if (!visible(el)) continue;
+
+                  const rect = el.getBoundingClientRect();
+
+                  if (rect.left < -3 || rect.right > viewportW + 3) {
+                    outsideProblems.push(`${label(el)} je mimo šířku obrazovky.`);
+                  }
+
+                  const centerX = Math.floor(rect.left + rect.width / 2);
+                  const centerY = Math.floor(rect.top + rect.height / 2);
+
+                  if (centerX < 0 || centerX > viewportW || centerY < 0 || centerY > viewportH) {
+                    continue;
+                  }
+
+                  const top = document.elementFromPoint(centerX, centerY);
+                  if (top && !(el === top || el.contains(top) || top.contains(el))) {
+                    interactiveProblems.push(`${label(el)} může být překryté prvkem ${label(top)}.`);
+                  }
+                }
+
+                const brokenImages = Array.from(document.images)
+                  .filter((img) => img.complete && img.naturalWidth === 0)
+                  .map((img) => img.currentSrc || img.src || img.alt || "obrázek")
+                  .slice(0, 10);
+
+                const candidates = Array.from(document.querySelectorAll("article, [class], [data-testid]"))
+                  .filter((el) => {
+                    if (!visible(el)) return false;
+                    const s = (
+                      String(el.className || "") +
+                      " " +
+                      String(el.getAttribute("data-testid") || "")
+                    ).toLowerCase();
+                    return s.includes("card") || s.includes("tile") || s.includes("dla") || el.tagName.toLowerCase() === "article";
+                  })
+                  .slice(0, 80);
+
+                const overlapProblems = [];
+
+                for (let i = 0; i < candidates.length; i++) {
+                  for (let j = i + 1; j < candidates.length; j++) {
+                    const a = candidates[i];
+                    const b = candidates[j];
+
+                    if (a.contains(b) || b.contains(a)) continue;
+
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+
+                    const x = Math.max(0, Math.min(ar.right, br.right) - Math.max(ar.left, br.left));
+                    const y = Math.max(0, Math.min(ar.bottom, br.bottom) - Math.max(ar.top, br.top));
+                    const overlap = x * y;
+
+                    if (overlap <= 0) continue;
+
+                    const areaA = ar.width * ar.height;
+                    const areaB = br.width * br.height;
+                    const smaller = Math.min(areaA, areaB);
+
+                    if (smaller > 800 && overlap / smaller > 0.35) {
+                      overlapProblems.push(`${label(a)} se výrazně překrývá s ${label(b)}.`);
+                    }
+
+                    if (overlapProblems.length >= 10) break;
+                  }
+                  if (overlapProblems.length >= 10) break;
+                }
+
+                return {
+                  title: document.title || "",
+                  overflowX,
+                  interactiveProblems: interactiveProblems.slice(0, 12),
+                  outsideProblems: outsideProblems.slice(0, 12),
+                  brokenImages,
+                  overlapProblems: overlapProblems.slice(0, 10)
+                };
+              });
+
+              if (checks.overflowX > 6) {
+                addFinding("P2", device.label, routeLabel(base, route), `Stránka má horizontální přetékání o ${Math.round(checks.overflowX)} px.`);
+                pageHadIssue = true;
+              }
+
+              for (const x of checks.outsideProblems) {
+                addFinding("P2", device.label, routeLabel(base, route), x);
+                pageHadIssue = true;
+              }
+
+              for (const x of checks.interactiveProblems) {
+                addFinding("P2", device.label, routeLabel(base, route), x);
+                pageHadIssue = true;
+              }
+
+              for (const x of checks.overlapProblems) {
+                addFinding("P3", device.label, routeLabel(base, route), "Možný překryv dlaždic/karet: " + x);
+                pageHadIssue = true;
+              }
+
+              for (const x of checks.brokenImages) {
+                addFinding("P3", device.label, routeLabel(base, route), "Rozbitý obrázek: " + x);
+                pageHadIssue = true;
+              }
+
+              for (const x of pageErrors.slice(0, 5)) {
+                addFinding("P2", device.label, routeLabel(base, route), "Runtime chyba stránky: " + x);
+                pageHadIssue = true;
+              }
+
+              for (const x of consoleErrors.slice(0, 5)) {
+                addFinding("P3", device.label, routeLabel(base, route), "Console error: " + x);
+                pageHadIssue = true;
+              }
+
+              for (const x of failedRequests.slice(0, 5)) {
+                addFinding("P3", device.label, routeLabel(base, route), "Selhaný request: " + x);
+                pageHadIssue = true;
+              }
+
+              for (const x of badResponses.slice(0, 5)) {
+                addFinding("P2", device.label, routeLabel(base, route), "Špatná HTTP odpověď: " + x);
+                pageHadIssue = true;
+              }
+
+              if (pageHadIssue) {
+                const screenshotPath = path.join(
+                  screenshotDir,
+                  `${safeName(device.name)}-${safeName(routeLabel(base, route))}.png`
+                );
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+              }
+            } catch (error) {
+              addFinding("P1", device.label, routeLabel(base, route), "Audit stránky spadl: " + error.message);
+            } finally {
+              await page.close().catch(() => {});
+              await context.close().catch(() => {});
+            }
+          }
+
+          function writeReport(baseText, routes) {
+            const lines = [];
+            lines.push("# Slovo · Cesta — denní crossover audit");
+            lines.push("");
+            lines.push(`Čas UTC: ${new Date().toISOString()}`);
+            lines.push(`Aplikace: ${baseText || "nenastaveno"}`);
+            lines.push("");
+            lines.push("## Co tento audit kontroluje");
+            lines.push("");
+            lines.push("- desktop, mobil portrait, mobil landscape, tablet portrait, tablet landscape");
+            lines.push("- načtení hlavních stránek");
+            lines.push("- HTTP chyby a selhané requesty");
+            lines.push("- runtime chyby a console error");
+            lines.push("- horizontální přetékání layoutu");
+            lines.push("- prvky mimo obrazovku");
+            lines.push("- překryté klikatelné prvky");
+            lines.push("- možné překryvy dlaždic a karet");
+            lines.push("- rozbité obrázky");
+            lines.push("");
+            lines.push("## Souhrn");
+            lines.push("");
+            lines.push(`- Kontrolovaných cest: ${routes.length}`);
+            lines.push(`- Kontrolovaných zařízení: ${devices.length}`);
+            lines.push(`- Celkem kontrol: ${tested.length}`);
+            lines.push(`- Nálezů: ${findings.length}`);
+            lines.push("");
+            lines.push("## Kontrolované stránky");
+            lines.push("");
+            for (const t of tested) {
+              lines.push(`- ${t}`);
+            }
+            lines.push("");
+            lines.push("## Nálezy");
+            lines.push("");
+            if (findings.length === 0) {
+              lines.push("✅ Bez vážného nálezu.");
+            } else {
+              findings.forEach((f, i) => {
+                lines.push(`${i + 1}. **${f.priority}** — ${f.device} — ${f.route}`);
+                lines.push(`   - ${f.message}`);
+              });
+              lines.push("");
+              lines.push("Screenshoty pro problematické stránky jsou uložené v GitHub Actions artifacts.");
+            }
+            lines.push("");
+            lines.push("## Poznámka");
+            lines.push("");
+            lines.push("Tento denní audit nekliká na nebezpečné akce jako mazání, odhlašování nebo platby. Kontroluje hlavně viditelnost, překryvy, načtení a základní použitelnost.");
+
+            fs.writeFileSync(path.join(outDir, "report.md"), lines.join("\n"), "utf8");
+            fs.writeFileSync(path.join(outDir, "issue-count.txt"), String(findings.length), "utf8");
+          }
+
+          async function main() {
+            if (!baseRaw) {
+              addFinding("P1", "nastavení", "/", "Chybí GitHub secret AUDIT_BASE_URL.");
+              writeReport("", []);
+              return;
+            }
+
+            const base = new URL(baseRaw);
+            const browser = await chromium.launch({ headless: true });
+
+            try {
+              const routes = await discoverRoutes(browser, base);
+
+              for (const route of routes) {
+                for (const device of devices) {
+                  await inspectPage(browser, base, route, device);
+                }
+              }
+
+              writeReport(base.href, routes);
+            } finally {
+              await browser.close().catch(() => {});
+            }
+          }
+
+          main().catch((error) => {
+            addFinding("P1", "infrastruktura", "/", "Denní crossover audit spadl: " + error.message);
+            writeReport(baseRaw, requestedRoutes);
+            process.exit(0);
+          });
+          JS
+
+      - name: Run daily crossover audit
+        id: audit
+        shell: bash
+        run: |
+          node crossover-audit.mjs
+          echo "issues=$(cat audit-results/issue-count.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-crossover-audit-results
+          path: audit-results
+          retention-days: 7
+
+      - name: Send daily e-mail report
+        if: always()
+        shell: bash
+        env:
+          ISSUE_COUNT: ${{ steps.audit.outputs.issues }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import smtplib
+          import ssl
+          from email.message import EmailMessage
+
+          report_path = "audit-results/report.md"
+          issue_count = os.environ.get("ISSUE_COUNT") or "?"
+          report_to = os.environ.get("REPORT_TO", "")
+          smtp_host = os.environ.get("SMTP_HOST", "")
+          smtp_user = os.environ.get("SMTP_USER", "")
+          smtp_pass = os.environ.get("SMTP_PASS", "")
+
+          if not os.path.exists(report_path):
+              body = "Denní crossover audit nedokázal vytvořit report.md. Zkontrolujte prosím GitHub Actions běh."
+              issue_count = "?"
+          else:
+              with open(report_path, "r", encoding="utf-8") as f:
+                  body = f.read()
+
+          missing = []
+          for key, value in {
+              "REPORT_TO": report_to,
+              "SMTP_HOST": smtp_host,
+              "SMTP_USER": smtp_user,
+              "SMTP_PASS": smtp_pass,
+          }.items():
+              if not value:
+                  missing.append(key)
+
+          if missing:
+              print("E-mail se neposílá, chybí:", ", ".join(missing))
+              raise SystemExit(0)
+
+          ok = str(issue_count) == "0"
+          subject = "Slovo Cesta denní crossover audit: OK" if ok else f"Slovo Cesta denní crossover audit: {issue_count} nález(ů)"
+
+          msg = EmailMessage()
+          msg["Subject"] = subject
+          msg["From"] = os.environ.get("REPORT_FROM") or smtp_user
+          msg["To"] = report_to
+          msg.set_content(body)
+
+          host = smtp_host
+          port = int(os.environ.get("SMTP_PORT") or "465")
+          secure = (os.environ.get("SMTP_SECURE") or "true").lower() == "true"
+
+          if secure:
+              with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context()) as s:
+                  s.login(smtp_user, smtp_pass)
+                  s.send_message(msg)
+          else:
+              with smtplib.SMTP(host, port) as s:
+                  s.starttls(context=ssl.create_default_context())
+                  s.login(smtp_user, smtp_pass)
+                  s.send_message(msg)
+          PY
