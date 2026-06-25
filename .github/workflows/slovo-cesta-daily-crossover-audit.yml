@@ -1,4 +1,5 @@
 name: Slovo Cesta daily crossover audit
+# v3: quieter clickable-overlap probe; tests multiple safe click points instead of center only
 
 on:
   workflow_dispatch:
@@ -293,14 +294,62 @@ jobs:
                     outsideProblems.push(`${ownLabel} je mimo šířku obrazovky.`);
                   }
 
-                  const centerX = Math.floor(rect.left + rect.width / 2);
-                  const centerY = Math.floor(rect.top + rect.height / 2);
-                  if (centerX < 0 || centerX > viewportW || centerY < 0 || centerY > viewportH) continue;
+                  function ownsTopElement(target, top) {
+                    return top && (target === top || target.contains(top) || top.contains(target));
+                  }
 
-                  const top = document.elementFromPoint(centerX, centerY);
-                  const topLabel = top ? label(top) : "";
-                  if (isOverlayNoiseText(topLabel)) continue;
-                  if (top && !(el === top || el.contains(top) || top.contains(el))) interactiveProblems.push(`${ownLabel} může být překryté prvkem ${topLabel}.`);
+                  function sampleClickablePoints(rect) {
+                    const insetX = Math.max(3, Math.min(24, rect.width * 0.25));
+                    const insetY = Math.max(3, Math.min(24, rect.height * 0.25));
+                    const raw = [
+                      [rect.left + rect.width / 2, rect.top + rect.height / 2],
+                      [rect.left + rect.width / 2, rect.top + insetY],
+                      [rect.left + rect.width / 2, rect.bottom - insetY],
+                      [rect.left + insetX, rect.top + rect.height / 2],
+                      [rect.right - insetX, rect.top + rect.height / 2],
+                      [rect.left + insetX, rect.top + insetY],
+                      [rect.right - insetX, rect.top + insetY]
+                    ];
+                    const seen = new Set();
+                    return raw
+                      .map(([x, y]) => [Math.floor(x), Math.floor(y)])
+                      .filter(([x, y]) => x >= 0 && x <= viewportW && y >= 0 && y <= viewportH)
+                      .filter(([x, y]) => {
+                        const key = `${x}:${y}`;
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                      });
+                  }
+
+                  function probeClickableArea(target, rect) {
+                    const points = sampleClickablePoints(rect);
+                    const blockers = [];
+
+                    for (const [x, y] of points) {
+                      const top = document.elementFromPoint(x, y);
+                      if (!top) continue;
+
+                      const topLabel = label(top);
+                      if (isOverlayNoiseText(topLabel)) continue;
+
+                      const topStyle = window.getComputedStyle(top);
+                      if (topStyle && topStyle.pointerEvents === "none") continue;
+
+                      if (ownsTopElement(target, top)) {
+                        return { clear: true, blocker: "" };
+                      }
+
+                      blockers.push(topLabel || top.tagName || "neznámý prvek");
+                    }
+
+                    return { clear: false, blocker: blockers[0] || "" };
+                  }
+
+                  const probe = probeClickableArea(el, rect);
+                  if (!probe.clear && probe.blocker && !isOverlayNoiseText(probe.blocker)) {
+                    interactiveProblems.push(`${ownLabel} může být překryté prvkem ${probe.blocker}.`);
+                  }
                 }
 
                 const brokenImages = Array.from(document.images).filter((img) => img.complete && img.naturalWidth === 0).map((img) => img.currentSrc || img.src || img.alt || "obrázek").slice(0, 10);
@@ -448,7 +497,7 @@ jobs:
               if (emailFindings.length > maxEmailFindings) email.push(`\nDalších ${emailFindings.length - maxEmailFindings} důležitých nálezů je jen v GitHub Actions artifact report.md.`);
             }
             email.push("");
-            email.push("Poznámka: cookie lišta, consent prvky, doporučení tmavého režimu a opakovaný Supabase ERR_ABORTED šum jsou potlačené, aby e-mail nebyl přeplněný.");
+            email.push("Poznámka: cookie lišta, consent prvky, doporučení tmavého režimu, opakovaný Supabase ERR_ABORTED šum a falešné překryvy velkých klikacích wrapperů jsou potlačené, aby e-mail nebyl přeplněný.");
 
             fs.writeFileSync(path.join(outDir, "report.md"), full.join("\n"), "utf8");
             fs.writeFileSync(path.join(outDir, "email-report.md"), email.join("\n"), "utf8");
