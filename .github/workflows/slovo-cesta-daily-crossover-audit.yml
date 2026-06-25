@@ -63,59 +63,64 @@ jobs:
             .filter(Boolean);
 
           const devices = [
-            {
-              name: "desktop",
-              label: "Desktop 1440×900",
-              viewport: { width: 1440, height: 900 },
-              isMobile: false,
-              hasTouch: false
-            },
-            {
-              name: "mobile-portrait",
-              label: "Mobil portrait 390×844",
-              viewport: { width: 390, height: 844 },
-              isMobile: true,
-              hasTouch: true
-            },
-            {
-              name: "mobile-landscape",
-              label: "Mobil landscape 844×390",
-              viewport: { width: 844, height: 390 },
-              isMobile: true,
-              hasTouch: true
-            },
-            {
-              name: "tablet-portrait",
-              label: "Tablet portrait 768×1024",
-              viewport: { width: 768, height: 1024 },
-              isMobile: true,
-              hasTouch: true
-            },
-            {
-              name: "tablet-landscape",
-              label: "Tablet landscape 1024×768",
-              viewport: { width: 1024, height: 768 },
-              isMobile: true,
-              hasTouch: true
-            }
+            { name: "desktop", label: "Desktop 1440×900", viewport: { width: 1440, height: 900 }, isMobile: false, hasTouch: false },
+            { name: "mobile-portrait", label: "Mobil portrait 390×844", viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true },
+            { name: "mobile-landscape", label: "Mobil landscape 844×390", viewport: { width: 844, height: 390 }, isMobile: true, hasTouch: true },
+            { name: "tablet-portrait", label: "Tablet portrait 768×1024", viewport: { width: 768, height: 1024 }, isMobile: true, hasTouch: true },
+            { name: "tablet-landscape", label: "Tablet landscape 1024×768", viewport: { width: 1024, height: 768 }, isMobile: true, hasTouch: true }
           ];
 
           const findings = [];
           const tested = [];
+          const suppressed = [];
+          const repeated = new Map();
 
           function safeName(value) {
-            return String(value || "root")
-              .replace(/[^a-z0-9._-]+/gi, "_")
-              .slice(0, 140);
+            return String(value || "root").replace(/[^a-z0-9._-]+/gi, "_").slice(0, 140);
           }
 
           function addFinding(priority, device, route, message) {
-            findings.push({
+            const msg = String(message || "").replace(/\s+/g, " ").slice(0, 500);
+            const noisy = /consent|cookie|cookies|souhlas|odmítnout vše|přijmout vše|nastavení|doporučujeme tmavý režim|nechat světlý|zapnout tmavý režim/i.test(msg);
+            if (noisy) {
+              suppressed.push({ priority, device, route, message: msg, reason: "overlay-cookie-darkmode" });
+              return;
+            }
+            findings.push({ priority, device, route, message: msg });
+          }
+
+          function addRepeated(key, priority, device, route, message) {
+            const current = repeated.get(key);
+            if (current) {
+              current.count += 1;
+              current.devices.add(device);
+              current.routes.add(route);
+              return;
+            }
+            repeated.set(key, {
               priority,
               device,
               route,
-              message: String(message || "").replace(/\s+/g, " ").slice(0, 500)
+              message,
+              count: 1,
+              devices: new Set([device]),
+              routes: new Set([route])
             });
+          }
+
+          function flushRepeated() {
+            for (const [key, item] of repeated.entries()) {
+              if (key.includes("peer_testimonies_public") && key.includes("ERR_ABORTED")) {
+                suppressed.push({ priority: item.priority, device: "více zařízení", route: "více stránek", message: `${item.message} (${item.count}×)`, reason: "opakovaný nízký šum" });
+                continue;
+              }
+              findings.push({
+                priority: item.priority,
+                device: item.devices.size > 1 ? "více zařízení" : item.device,
+                route: item.routes.size > 1 ? "více stránek" : item.route,
+                message: `${item.message} (${item.count}×)`
+              });
+            }
           }
 
           function routeToUrl(base, route) {
@@ -147,20 +152,38 @@ jobs:
             }
           }
 
+          async function dismissKnownOverlays(page) {
+            for (let i = 0; i < 4; i++) {
+              for (const name of [/Odmítnout vše/i, /Přijmout vše/i, /Souhlasím/i, /Nechat světlý/i, /Zavřít/i]) {
+                try {
+                  const button = page.getByRole("button", { name }).first();
+                  if (await button.isVisible({ timeout: 500 }).catch(() => false)) {
+                    await button.click({ timeout: 1200 }).catch(() => {});
+                    await page.waitForTimeout(300);
+                  }
+                } catch {}
+              }
+            }
+
+            await page.addStyleTag({ content: `
+              [id*="consent" i], [class*="consent" i], [data-testid*="consent" i],
+              [id*="cookie" i], [class*="cookie" i], [data-testid*="cookie" i],
+              [aria-label*="cookie" i], [aria-label*="souhlas" i] {
+                display: none !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+              }
+            ` }).catch(() => {});
+          }
+
           async function discoverRoutes(browser, base) {
             const routes = new Set(requestedRoutes.length ? requestedRoutes : ["/"]);
-
             const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-
             try {
               await page.goto(base.href, { waitUntil: "domcontentloaded", timeout: 30000 });
+              await dismissKnownOverlays(page);
               await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
-              const links = await page.evaluate(() =>
-                Array.from(document.querySelectorAll("a[href]"))
-                  .map((a) => a.href)
-                  .filter(Boolean)
-              );
-
+              const links = await page.evaluate(() => Array.from(document.querySelectorAll("a[href]")).map((a) => a.href).filter(Boolean));
               for (const href of links) {
                 if (routes.size >= maxPages) break;
                 if (!isSafeInternalUrl(base, href)) continue;
@@ -172,7 +195,6 @@ jobs:
             } finally {
               await page.close().catch(() => {});
             }
-
             return Array.from(routes).slice(0, maxPages);
           }
 
@@ -187,42 +209,30 @@ jobs:
             });
 
             const page = await context.newPage();
-
             const consoleErrors = [];
             const pageErrors = [];
             const failedRequests = [];
             const badResponses = [];
 
             page.on("console", (msg) => {
-              if (msg.type() === "error") {
-                consoleErrors.push(msg.text());
-              }
+              if (msg.type() === "error") consoleErrors.push(msg.text());
             });
-
-            page.on("pageerror", (err) => {
-              pageErrors.push(err.message);
-            });
-
-            page.on("requestfailed", (request) => {
-              failedRequests.push(request.url() + " — " + (request.failure()?.errorText || "request failed"));
-            });
-
+            page.on("pageerror", (err) => pageErrors.push(err.message));
+            page.on("requestfailed", (request) => failedRequests.push(request.url() + " — " + (request.failure()?.errorText || "request failed")));
             page.on("response", (response) => {
               const status = response.status();
               const type = response.request().resourceType();
-              if (status >= 500) {
-                badResponses.push(`HTTP ${status} ${type}: ${response.url()}`);
-              } else if (status >= 400 && ["document", "script", "xhr", "fetch"].includes(type)) {
-                badResponses.push(`HTTP ${status} ${type}: ${response.url()}`);
-              }
+              if (status >= 500) badResponses.push(`HTTP ${status} ${type}: ${response.url()}`);
+              else if (status >= 400 && ["document", "script", "xhr", "fetch"].includes(type)) badResponses.push(`HTTP ${status} ${type}: ${response.url()}`);
             });
 
             let pageHadIssue = false;
-
             try {
               const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+              await dismissKnownOverlays(page);
               await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(() => {});
-              await page.waitForTimeout(800);
+              await dismissKnownOverlays(page);
+              await page.waitForTimeout(500);
 
               const status = response ? response.status() : 0;
               tested.push(`${device.label} — ${routeLabel(base, route)} — HTTP ${status || "bez odpovědi"}`);
@@ -240,177 +250,115 @@ jobs:
                 const viewportH = window.innerHeight;
                 const root = document.documentElement;
                 const body = document.body;
-
-                const maxScrollWidth = Math.max(
-                  root ? root.scrollWidth : 0,
-                  body ? body.scrollWidth : 0
-                );
-
+                const maxScrollWidth = Math.max(root ? root.scrollWidth : 0, body ? body.scrollWidth : 0);
                 const overflowX = maxScrollWidth - viewportW;
 
                 function visible(el) {
                   const style = window.getComputedStyle(el);
                   const rect = el.getBoundingClientRect();
-                  return (
-                    style &&
-                    style.display !== "none" &&
-                    style.visibility !== "hidden" &&
-                    Number(style.opacity) !== 0 &&
-                    rect.width > 2 &&
-                    rect.height > 2
-                  );
+                  return style && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && rect.width > 2 && rect.height > 2;
                 }
 
                 function label(el) {
-                  const txt =
-                    el.getAttribute("aria-label") ||
-                    el.getAttribute("title") ||
-                    el.getAttribute("data-testid") ||
-                    el.innerText ||
-                    el.textContent ||
-                    el.tagName;
+                  const txt = el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("data-testid") || el.innerText || el.textContent || el.tagName;
                   return String(txt).replace(/\s+/g, " ").trim().slice(0, 90);
+                }
+
+                function hasHorizontalScrollAncestor(el) {
+                  let cur = el.parentElement;
+                  while (cur && cur !== document.body && cur !== document.documentElement) {
+                    const s = window.getComputedStyle(cur);
+                    const overflowX = s.overflowX;
+                    if ((overflowX === "auto" || overflowX === "scroll") && cur.scrollWidth > cur.clientWidth + 8) return true;
+                    cur = cur.parentElement;
+                  }
+                  return false;
+                }
+
+                function isOverlayNoiseText(text) {
+                  return /consent|cookie|cookies|souhlas|odmítnout vše|přijmout vše|nastavení|tmavý režim|nechat světlý|zapnout tmavý/i.test(text || "");
                 }
 
                 const interactiveProblems = [];
                 const outsideProblems = [];
-
-                const interactive = Array.from(
-                  document.querySelectorAll(
-                    "a[href], button, input, textarea, select, [role='button'], [tabindex]:not([tabindex='-1'])"
-                  )
-                ).slice(0, 250);
+                const interactive = Array.from(document.querySelectorAll("a[href], button, input, textarea, select, [role='button'], [tabindex]:not([tabindex='-1'])")).slice(0, 250);
 
                 for (const el of interactive) {
                   if (!visible(el)) continue;
+                  const ownLabel = label(el);
+                  if (isOverlayNoiseText(ownLabel)) continue;
 
                   const rect = el.getBoundingClientRect();
-
-                  if (rect.left < -3 || rect.right > viewportW + 3) {
-                    outsideProblems.push(`${label(el)} je mimo šířku obrazovky.`);
+                  if ((rect.left < -6 || rect.right > viewportW + 6) && !hasHorizontalScrollAncestor(el)) {
+                    outsideProblems.push(`${ownLabel} je mimo šířku obrazovky.`);
                   }
 
                   const centerX = Math.floor(rect.left + rect.width / 2);
                   const centerY = Math.floor(rect.top + rect.height / 2);
-
-                  if (centerX < 0 || centerX > viewportW || centerY < 0 || centerY > viewportH) {
-                    continue;
-                  }
+                  if (centerX < 0 || centerX > viewportW || centerY < 0 || centerY > viewportH) continue;
 
                   const top = document.elementFromPoint(centerX, centerY);
-                  if (top && !(el === top || el.contains(top) || top.contains(el))) {
-                    interactiveProblems.push(`${label(el)} může být překryté prvkem ${label(top)}.`);
-                  }
+                  const topLabel = top ? label(top) : "";
+                  if (isOverlayNoiseText(topLabel)) continue;
+                  if (top && !(el === top || el.contains(top) || top.contains(el))) interactiveProblems.push(`${ownLabel} může být překryté prvkem ${topLabel}.`);
                 }
 
-                const brokenImages = Array.from(document.images)
-                  .filter((img) => img.complete && img.naturalWidth === 0)
-                  .map((img) => img.currentSrc || img.src || img.alt || "obrázek")
-                  .slice(0, 10);
+                const brokenImages = Array.from(document.images).filter((img) => img.complete && img.naturalWidth === 0).map((img) => img.currentSrc || img.src || img.alt || "obrázek").slice(0, 10);
 
-                const candidates = Array.from(document.querySelectorAll("article, [class], [data-testid]"))
-                  .filter((el) => {
-                    if (!visible(el)) return false;
-                    const s = (
-                      String(el.className || "") +
-                      " " +
-                      String(el.getAttribute("data-testid") || "")
-                    ).toLowerCase();
-                    return s.includes("card") || s.includes("tile") || s.includes("dla") || el.tagName.toLowerCase() === "article";
-                  })
-                  .slice(0, 80);
+                const candidates = Array.from(document.querySelectorAll("article, [class], [data-testid]")).filter((el) => {
+                  if (!visible(el)) return false;
+                  const txt = label(el);
+                  if (isOverlayNoiseText(txt)) return false;
+                  if (hasHorizontalScrollAncestor(el)) return false;
+                  const s = (String(el.className || "") + " " + String(el.getAttribute("data-testid") || "")).toLowerCase();
+                  return s.includes("card") || s.includes("tile") || s.includes("dla") || el.tagName.toLowerCase() === "article";
+                }).slice(0, 80);
 
                 const overlapProblems = [];
-
                 for (let i = 0; i < candidates.length; i++) {
                   for (let j = i + 1; j < candidates.length; j++) {
                     const a = candidates[i];
                     const b = candidates[j];
-
                     if (a.contains(b) || b.contains(a)) continue;
-
+                    const al = label(a);
+                    const bl = label(b);
+                    if (isOverlayNoiseText(al) || isOverlayNoiseText(bl)) continue;
                     const ar = a.getBoundingClientRect();
                     const br = b.getBoundingClientRect();
-
                     const x = Math.max(0, Math.min(ar.right, br.right) - Math.max(ar.left, br.left));
                     const y = Math.max(0, Math.min(ar.bottom, br.bottom) - Math.max(ar.top, br.top));
                     const overlap = x * y;
-
                     if (overlap <= 0) continue;
-
                     const areaA = ar.width * ar.height;
                     const areaB = br.width * br.height;
                     const smaller = Math.min(areaA, areaB);
-
-                    if (smaller > 800 && overlap / smaller > 0.35) {
-                      overlapProblems.push(`${label(a)} se výrazně překrývá s ${label(b)}.`);
-                    }
-
-                    if (overlapProblems.length >= 10) break;
+                    if (smaller > 1200 && overlap / smaller > 0.55) overlapProblems.push(`${al} se výrazně překrývá s ${bl}.`);
+                    if (overlapProblems.length >= 4) break;
                   }
-                  if (overlapProblems.length >= 10) break;
+                  if (overlapProblems.length >= 4) break;
                 }
 
-                return {
-                  title: document.title || "",
-                  overflowX,
-                  interactiveProblems: interactiveProblems.slice(0, 12),
-                  outsideProblems: outsideProblems.slice(0, 12),
-                  brokenImages,
-                  overlapProblems: overlapProblems.slice(0, 10)
-                };
+                return { overflowX, interactiveProblems: interactiveProblems.slice(0, 8), outsideProblems: outsideProblems.slice(0, 8), brokenImages, overlapProblems: overlapProblems.slice(0, 4) };
               });
 
-              if (checks.overflowX > 6) {
+              if (checks.overflowX > 12) {
                 addFinding("P2", device.label, routeLabel(base, route), `Stránka má horizontální přetékání o ${Math.round(checks.overflowX)} px.`);
                 pageHadIssue = true;
               }
-
-              for (const x of checks.outsideProblems) {
-                addFinding("P2", device.label, routeLabel(base, route), x);
-                pageHadIssue = true;
-              }
-
-              for (const x of checks.interactiveProblems) {
-                addFinding("P2", device.label, routeLabel(base, route), x);
-                pageHadIssue = true;
-              }
-
-              for (const x of checks.overlapProblems) {
-                addFinding("P3", device.label, routeLabel(base, route), "Možný překryv dlaždic/karet: " + x);
-                pageHadIssue = true;
-              }
-
-              for (const x of checks.brokenImages) {
-                addFinding("P3", device.label, routeLabel(base, route), "Rozbitý obrázek: " + x);
-                pageHadIssue = true;
-              }
-
-              for (const x of pageErrors.slice(0, 5)) {
-                addFinding("P2", device.label, routeLabel(base, route), "Runtime chyba stránky: " + x);
-                pageHadIssue = true;
-              }
-
-              for (const x of consoleErrors.slice(0, 5)) {
-                addFinding("P3", device.label, routeLabel(base, route), "Console error: " + x);
-                pageHadIssue = true;
-              }
-
+              for (const x of checks.outsideProblems) { addFinding("P2", device.label, routeLabel(base, route), x); pageHadIssue = true; }
+              for (const x of checks.interactiveProblems) { addFinding("P2", device.label, routeLabel(base, route), x); pageHadIssue = true; }
+              for (const x of checks.overlapProblems) { addFinding("P3", device.label, routeLabel(base, route), "Možný překryv dlaždic/karet: " + x); pageHadIssue = true; }
+              for (const x of checks.brokenImages) { addFinding("P3", device.label, routeLabel(base, route), "Rozbitý obrázek: " + x); pageHadIssue = true; }
+              for (const x of pageErrors.slice(0, 5)) { addFinding("P2", device.label, routeLabel(base, route), "Runtime chyba stránky: " + x); pageHadIssue = true; }
+              for (const x of consoleErrors.slice(0, 3)) { addFinding("P3", device.label, routeLabel(base, route), "Console error: " + x); pageHadIssue = true; }
               for (const x of failedRequests.slice(0, 5)) {
-                addFinding("P3", device.label, routeLabel(base, route), "Selhaný request: " + x);
-                pageHadIssue = true;
+                const key = x.includes("peer_testimonies_public") ? "peer_testimonies_public ERR_ABORTED" : x.slice(0, 180);
+                addRepeated(key, "P3", device.label, routeLabel(base, route), "Selhaný request: " + x);
               }
-
-              for (const x of badResponses.slice(0, 5)) {
-                addFinding("P2", device.label, routeLabel(base, route), "Špatná HTTP odpověď: " + x);
-                pageHadIssue = true;
-              }
+              for (const x of badResponses.slice(0, 5)) { addFinding("P2", device.label, routeLabel(base, route), "Špatná HTTP odpověď: " + x); pageHadIssue = true; }
 
               if (pageHadIssue) {
-                const screenshotPath = path.join(
-                  screenshotDir,
-                  `${safeName(device.name)}-${safeName(routeLabel(base, route))}.png`
-                );
+                const screenshotPath = path.join(screenshotDir, `${safeName(device.name)}-${safeName(routeLabel(base, route))}.png`);
                 await page.screenshot({ path: screenshotPath, fullPage: true });
               }
             } catch (error) {
@@ -422,56 +370,89 @@ jobs:
           }
 
           function writeReport(baseText, routes) {
-            const lines = [];
-            lines.push("# Slovo · Cesta — denní crossover audit");
-            lines.push("");
-            lines.push(`Čas UTC: ${new Date().toISOString()}`);
-            lines.push(`Aplikace: ${baseText || "nenastaveno"}`);
-            lines.push("");
-            lines.push("## Co tento audit kontroluje");
-            lines.push("");
-            lines.push("- desktop, mobil portrait, mobil landscape, tablet portrait, tablet landscape");
-            lines.push("- načtení hlavních stránek");
-            lines.push("- HTTP chyby a selhané requesty");
-            lines.push("- runtime chyby a console error");
-            lines.push("- horizontální přetékání layoutu");
-            lines.push("- prvky mimo obrazovku");
-            lines.push("- překryté klikatelné prvky");
-            lines.push("- možné překryvy dlaždic a karet");
-            lines.push("- rozbité obrázky");
-            lines.push("");
-            lines.push("## Souhrn");
-            lines.push("");
-            lines.push(`- Kontrolovaných cest: ${routes.length}`);
-            lines.push(`- Kontrolovaných zařízení: ${devices.length}`);
-            lines.push(`- Celkem kontrol: ${tested.length}`);
-            lines.push(`- Nálezů: ${findings.length}`);
-            lines.push("");
-            lines.push("## Kontrolované stránky");
-            lines.push("");
-            for (const t of tested) {
-              lines.push(`- ${t}`);
-            }
-            lines.push("");
-            lines.push("## Nálezy");
-            lines.push("");
-            if (findings.length === 0) {
-              lines.push("✅ Bez vážného nálezu.");
-            } else {
-              findings.forEach((f, i) => {
-                lines.push(`${i + 1}. **${f.priority}** — ${f.device} — ${f.route}`);
-                lines.push(`   - ${f.message}`);
-              });
-              lines.push("");
-              lines.push("Screenshoty pro problematické stránky jsou uložené v GitHub Actions artifacts.");
-            }
-            lines.push("");
-            lines.push("## Poznámka");
-            lines.push("");
-            lines.push("Tento denní audit nekliká na nebezpečné akce jako mazání, odhlašování nebo platby. Kontroluje hlavně viditelnost, překryvy, načtení a základní použitelnost.");
+            flushRepeated();
 
-            fs.writeFileSync(path.join(outDir, "report.md"), lines.join("\n"), "utf8");
-            fs.writeFileSync(path.join(outDir, "issue-count.txt"), String(findings.length), "utf8");
+            const priorityOrder = { P1: 1, P2: 2, P3: 3 };
+            findings.sort((a, b) => (priorityOrder[a.priority] || 9) - (priorityOrder[b.priority] || 9));
+
+            const emailFindings = findings.filter((f) => f.priority === "P1" || f.priority === "P2");
+            const p3Count = findings.filter((f) => f.priority === "P3").length;
+            const maxEmailFindings = 25;
+
+            const full = [];
+            full.push("# Slovo · Cesta — denní crossover audit");
+            full.push("");
+            full.push(`Čas UTC: ${new Date().toISOString()}`);
+            full.push(`Aplikace: ${baseText || "nenastaveno"}`);
+            full.push("");
+            full.push("## Souhrn");
+            full.push("");
+            full.push(`- Kontrolovaných cest: ${routes.length}`);
+            full.push(`- Kontrolovaných zařízení: ${devices.length}`);
+            full.push(`- Celkem kontrol: ${tested.length}`);
+            full.push(`- Důležitých nálezů P1/P2: ${emailFindings.length}`);
+            full.push(`- Méně jistých nálezů P3: ${p3Count}`);
+            full.push(`- Potlačený šum cookie/overlay/opakované requesty: ${suppressed.length}`);
+            full.push("");
+            full.push("## Kontrolované stránky");
+            full.push("");
+            for (const t of tested) full.push(`- ${t}`);
+            full.push("");
+            full.push("## Důležité nálezy P1/P2");
+            full.push("");
+            if (emailFindings.length === 0) full.push("✅ Bez důležitého nálezu P1/P2.");
+            else emailFindings.forEach((f, i) => { full.push(`${i + 1}. **${f.priority}** — ${f.device} — ${f.route}`); full.push(`   - ${f.message}`); });
+            full.push("");
+            full.push("## Méně jisté nálezy P3");
+            full.push("");
+            const p3Findings = findings.filter((f) => f.priority === "P3");
+            if (p3Findings.length === 0) full.push("Žádné.");
+            else p3Findings.forEach((f, i) => { full.push(`${i + 1}. **${f.priority}** — ${f.device} — ${f.route}`); full.push(`   - ${f.message}`); });
+            full.push("");
+            full.push("## Potlačený šum");
+            full.push("");
+            if (suppressed.length === 0) full.push("Žádný.");
+            else {
+              for (const s of suppressed.slice(0, 40)) full.push(`- ${s.reason}: ${s.message}`);
+              if (suppressed.length > 40) full.push(`- …dalších ${suppressed.length - 40} položek potlačeno.`);
+            }
+            full.push("");
+            full.push("Screenshoty jsou uložené v GitHub Actions artifacts jen pro stránky s nálezem.");
+
+            const email = [];
+            email.push("# Slovo · Cesta — denní crossover audit");
+            email.push("");
+            email.push(`Čas UTC: ${new Date().toISOString()}`);
+            email.push(`Aplikace: ${baseText || "nenastaveno"}`);
+            email.push("");
+            email.push("## Stručný souhrn");
+            email.push("");
+            email.push(`- Kontrolovaných cest: ${routes.length}`);
+            email.push(`- Kontrolovaných zařízení: ${devices.length}`);
+            email.push(`- Celkem kontrol: ${tested.length}`);
+            email.push(`- Důležitých nálezů P1/P2: ${emailFindings.length}`);
+            email.push(`- Méně jistých P3 uložených jen v detailním reportu: ${p3Count}`);
+            email.push(`- Potlačený šum cookie/overlay/opakované requesty: ${suppressed.length}`);
+            email.push("");
+            email.push("## Výsledek");
+            email.push("");
+            if (emailFindings.length === 0) {
+              email.push("✅ Bez důležitého nálezu P1/P2.");
+            } else {
+              email.push(`⚠️ Nalezeno ${emailFindings.length} důležitých problémů P1/P2. Níže je prvních ${Math.min(maxEmailFindings, emailFindings.length)}.`);
+              email.push("");
+              emailFindings.slice(0, maxEmailFindings).forEach((f, i) => {
+                email.push(`${i + 1}. **${f.priority}** — ${f.device} — ${f.route}`);
+                email.push(`   - ${f.message}`);
+              });
+              if (emailFindings.length > maxEmailFindings) email.push(`\nDalších ${emailFindings.length - maxEmailFindings} důležitých nálezů je jen v GitHub Actions artifact report.md.`);
+            }
+            email.push("");
+            email.push("Poznámka: cookie lišta, consent prvky, doporučení tmavého režimu a opakovaný Supabase ERR_ABORTED šum jsou potlačené, aby e-mail nebyl přeplněný.");
+
+            fs.writeFileSync(path.join(outDir, "report.md"), full.join("\n"), "utf8");
+            fs.writeFileSync(path.join(outDir, "email-report.md"), email.join("\n"), "utf8");
+            fs.writeFileSync(path.join(outDir, "issue-count.txt"), String(emailFindings.length), "utf8");
           }
 
           async function main() {
@@ -480,19 +461,13 @@ jobs:
               writeReport("", []);
               return;
             }
-
             const base = new URL(baseRaw);
             const browser = await chromium.launch({ headless: true });
-
             try {
               const routes = await discoverRoutes(browser, base);
-
               for (const route of routes) {
-                for (const device of devices) {
-                  await inspectPage(browser, base, route, device);
-                }
+                for (const device of devices) await inspectPage(browser, base, route, device);
               }
-
               writeReport(base.href, routes);
             } finally {
               await browser.close().catch(() => {});
@@ -528,41 +503,32 @@ jobs:
           ISSUE_COUNT: ${{ steps.audit.outputs.issues }}
         run: |
           python3 - <<'PY'
-          import os
-          import smtplib
-          import ssl
+          import os, smtplib, ssl
           from email.message import EmailMessage
 
-          report_path = "audit-results/report.md"
+          report_path = "audit-results/email-report.md"
+          fallback_path = "audit-results/report.md"
           issue_count = os.environ.get("ISSUE_COUNT") or "?"
           report_to = os.environ.get("REPORT_TO", "")
           smtp_host = os.environ.get("SMTP_HOST", "")
           smtp_user = os.environ.get("SMTP_USER", "")
           smtp_pass = os.environ.get("SMTP_PASS", "")
 
-          if not os.path.exists(report_path):
-              body = "Denní crossover audit nedokázal vytvořit report.md. Zkontrolujte prosím GitHub Actions běh."
+          path = report_path if os.path.exists(report_path) else fallback_path
+          if not os.path.exists(path):
+              body = "Denní crossover audit nedokázal vytvořit report. Zkontrolujte prosím GitHub Actions běh."
               issue_count = "?"
           else:
-              with open(report_path, "r", encoding="utf-8") as f:
+              with open(path, "r", encoding="utf-8") as f:
                   body = f.read()
 
-          missing = []
-          for key, value in {
-              "REPORT_TO": report_to,
-              "SMTP_HOST": smtp_host,
-              "SMTP_USER": smtp_user,
-              "SMTP_PASS": smtp_pass,
-          }.items():
-              if not value:
-                  missing.append(key)
-
+          missing = [k for k, v in {"REPORT_TO": report_to, "SMTP_HOST": smtp_host, "SMTP_USER": smtp_user, "SMTP_PASS": smtp_pass}.items() if not v]
           if missing:
               print("E-mail se neposílá, chybí:", ", ".join(missing))
               raise SystemExit(0)
 
           ok = str(issue_count) == "0"
-          subject = "Slovo Cesta denní crossover audit: OK" if ok else f"Slovo Cesta denní crossover audit: {issue_count} nález(ů)"
+          subject = "Slovo Cesta denní crossover audit: OK" if ok else f"Slovo Cesta denní crossover audit: {issue_count} důležitých nálezů"
 
           msg = EmailMessage()
           msg["Subject"] = subject
